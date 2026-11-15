@@ -1,0 +1,17 @@
+diff --git a/src/anomalib/data/utils/synthetic.py b/src/anomalib/data/utils/synthetic.py
+index 1fde969..28c6013 100644
+--- a/src/anomalib/data/utils/synthetic.py
++++ b/src/anomalib/data/utils/synthetic.py
+@@ -247,6 +247,12 @@ class SyntheticAnomalyDataset(AnomalibDataset):
+         self._cleanup = False
+         return new
+ 
++    def __getstate__(self) -> dict:
++        """Pickled copies (spawned DataLoader workers) must never delete the shared temp dir."""
++        state = self.__dict__.copy()
++        state["_cleanup"] = False
++        return state
++
+     def __del__(self) -> None:
+         """Clean up temporary directory when dataset object is deleted."""
+         if self._cleanup:

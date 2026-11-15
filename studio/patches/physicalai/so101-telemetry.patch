@@ -1,0 +1,245 @@
+--- a/physicalai_so101_plugin/so101.py
++++ b/physicalai_so101_plugin/so101.py
+@@ -88,7 +88,7 @@
+ 
+     joint_positions: np.ndarray
+     timestamp: float
+-    sensor_data: dict[str, np.ndarray] | None = None  # no extra sensors available on SO-101
++    sensor_data: dict[str, np.ndarray] | None = None
+     images: dict[str, Frame] | None = None  # no built-in camera implementation
+ 
+     @property
+@@ -121,6 +121,12 @@
+     NUM_JOINTS: ClassVar[int] = 6
+     """Number of joints / servos on the SO-101."""
+ 
++    TELEMETRY_NAMES: ClassVar[tuple[str, ...]] = tuple(
++        [f"motor.{quantity}.{joint}" for quantity in ("velocity", "load", "voltage", "temperature", "current") for joint in SO101_JOINT_ORDER]
++        + ["ee.x", "ee.y", "ee.z", "ee.roll", "ee.pitch", "ee.yaw"]
++    )
++    """Stable telemetry feature names exposed by observations."""
++
+     SYNC_READ_ATTEMPTS: ClassVar[int] = 3
+     """Total sync-read attempts per observation before a bus failure is raised."""
+ 
+@@ -217,6 +223,11 @@
+         )
+ 
+     @property
++    def telemetry_names(self) -> list[str]:
++        """Stable telemetry vector names in observation.telemetry order."""
++        return list(self.TELEMETRY_NAMES)
++
++    @property
+     def joint_names(self) -> list[str]:
+         """List of joint names in the order they appear in state/action arrays."""
+         return self.JOINT_ORDER
+@@ -391,7 +402,7 @@
+                 port_handler,
+                 packet_handler,
+                 STS3215Addr.PRESENT_POSITION,
+-                STS3215Len.PRESENT_POSITION,
++                15,
+             )
+             for servo_id in self.servo_ids.values():
+                 if not group_sync_read.addParam(servo_id):
+@@ -418,7 +429,12 @@
+             self._configure_servos()
+ 
+             # Configure torque based on role ------------------------------------
+-            self._set_torque(enabled=self.role == "follower")
++            if self.role == "follower":
++                # Goal = where the arm is before torque comes on: the goal register may still hold the last
++                # command from before torque was cut, which the arm would otherwise snap to.
++                self._hold_position()
++            else:
++                self._set_torque(enabled=False)
+         except (OSError, RuntimeError):
+             with contextlib.suppress(Exception):
+                 port_handler.closePort()
+@@ -499,7 +515,7 @@
+             - ``images``: always ``None`` because SO-101 has no built-in
+                 camera support in this implementation.
+         """
+-        raw_positions = self._read_joint_positions()
++        raw_positions, telemetry = self._read_telemetry()
+ 
+         if self._calibration is not None:
+             state = self._ticks_to_unit(raw_positions)
+@@ -516,6 +532,7 @@
+         return SO101Observation(
+             joint_positions=state,
+             timestamp=time.monotonic(),
++            sensor_data=telemetry,
+         )
+ 
+     def send_action(self, action: np.ndarray, *, goal_time: float = 0.1) -> None:
+@@ -722,60 +739,95 @@
+         self._set_torque(enabled=True)
+ 
+     def _read_joint_positions(self) -> np.ndarray:
+-        """Bulk-read present positions from all servos, retrying transient failures.
+-
+-        A single dropped or corrupt reply on the servo bus (for example comm
+-        result ``-6`` timeout or ``-7`` corrupt packet after a supply dip) is
+-        retried up to :attr:`SYNC_READ_ATTEMPTS` times in total before giving up.
+-
+-        Returns:
+-            Int32 array of raw tick positions, shape ``(6,)``.
++        """Read positions only (used by safe hold/write paths)."""
++        positions, _ = self._read_telemetry()
++        return positions
+ 
+-        Raises:
+-            ConnectionError: If every sync read attempt fails.
+-        """  # noqa: DOC502 — raised by the delegated _sync_read_positions_once(), but callers see it here.
+-        conn = self._require_connection()
+-        for attempt in range(1, self.SYNC_READ_ATTEMPTS):
+-            try:
+-                return self._sync_read_positions_once(conn)
+-            except ConnectionError as exc:
+-                logger.warning(
+-                    f"SO-101 sync read attempt {attempt}/{self.SYNC_READ_ATTEMPTS} on {self.port} failed: {exc}"
+-                )
+-        return self._sync_read_positions_once(conn)
++    @staticmethod
++    def _decode_velocity(raw: int) -> float:
++        """Decode STS3215 sign-magnitude velocity (0.0146 RPM per step/s)."""
++        magnitude = raw & 0x7FFF
++        return (-1.0 if raw & 0x8000 else 1.0) * magnitude * 0.0146
+ 
+-    def _sync_read_positions_once(self, conn: _SO101Connection) -> np.ndarray:
+-        """Run one sync-read transaction and decode the present positions.
++    @staticmethod
++    def _decode_load(raw: int) -> float:
++        magnitude = raw & 0x03FF
++        return (-1.0 if raw & 0x0400 else 1.0) * magnitude * 0.1
+ 
+-        Returns:
+-            Int32 array of raw tick positions, shape ``(6,)``.
++    @staticmethod
++    def _forward_kinematics(degrees: np.ndarray) -> np.ndarray:
++        """Compute the gripper frame from the official SO-101 follower URDF chain."""
++        q = np.radians(degrees.astype(np.float64))
++        chain = (
++            ((0.0388353, -8.97657e-09, 0.0624), (3.14159, 4.18253e-17, -3.14159)),
++            ((-0.0303992, -0.0182778, -0.0542), (-1.5708, -1.5708, 0.0)),
++            ((-0.11257, -0.028, 1.73763e-16), (-3.63608e-16, 8.74301e-16, 1.5708)),
++            ((-0.1349, 0.0052, 3.62355e-17), (4.02456e-15, 8.67362e-16, -1.5708)),
++            ((5.55112e-17, -0.0611, 0.0181), (1.5708, 0.0486795, 3.14159)),
++        )
++        tool = ((-0.0079, -0.000218121, -0.0981274), (0.0, 3.14159, 0.0))
+ 
+-        Raises:
+-            ConnectionError: If the transaction fails or a servo's data is missing.
+-        """
+-        comm_result = conn.group_sync_read.txRxPacket()
+-        if comm_result != 0:
+-            msg = f"Sync read failed with comm result {comm_result}"
+-            raise ConnectionError(msg)
++        def origin(xyz: tuple[float, float, float], rpy: tuple[float, float, float]) -> np.ndarray:
++            r, pitch, yaw = rpy
++            cr, sr, cp, sp, cy, sy = (np.cos(r), np.sin(r), np.cos(pitch), np.sin(pitch), np.cos(yaw), np.sin(yaw))
++            return np.asarray([[cy * cp, cy * sp * sr - sy * cr, cy * sp * cr + sy * sr, xyz[0]],
++                [sy * cp, sy * sp * sr + cy * cr, sy * sp * cr - cy * sr, xyz[1]],
++                [-sp, cp * sr, cp * cr, xyz[2]], [0.0, 0.0, 0.0, 1.0]])
++
++        def rz(angle: float) -> np.ndarray:
++            c, si = np.cos(angle), np.sin(angle)
++            return np.asarray([[c, -si, 0.0, 0.0], [si, c, 0.0, 0.0], [0.0, 0.0, 1.0, 0.0], [0.0, 0.0, 0.0, 1.0]])
++
++        transform = np.eye(4)
++        for angle, (xyz, rpy) in zip(q[:5], chain, strict=True):
++            transform = transform @ origin(xyz, rpy) @ rz(float(angle))
++        transform = transform @ origin(*tool)
++        rotation = transform[:3, :3]
++        pitch = np.arctan2(-rotation[2, 0], np.hypot(rotation[0, 0], rotation[1, 0]))
++        roll = np.arctan2(rotation[2, 1], rotation[2, 2])
++        yaw = np.arctan2(rotation[1, 0], rotation[0, 0])
++        return np.asarray([transform[0, 3], transform[1, 3], transform[2, 3], roll, pitch, yaw], dtype=np.float32)
+ 
+-        positions = np.empty(self.NUM_JOINTS, dtype=np.int32)
+-        for i, name in enumerate(self.JOINT_ORDER):
+-            servo_id = self.servo_ids[name]
+-            if not conn.group_sync_read.isAvailable(
+-                servo_id,
+-                STS3215Addr.PRESENT_POSITION,
+-                STS3215Len.PRESENT_POSITION,
+-            ):
+-                msg = f"Servo '{name}' (ID {servo_id}) data not available in sync read"
+-                raise ConnectionError(msg)
+-            positions[i] = conn.group_sync_read.getData(
+-                servo_id,
+-                STS3215Addr.PRESENT_POSITION,
+-                STS3215Len.PRESENT_POSITION,
+-            )
+-            if self.unit == "degrees" and positions[i] & 0x8000:
+-                positions[i] = -(positions[i] & ~0x8000)
+-        return positions
++    def _read_telemetry(self) -> tuple[np.ndarray, dict[str, np.ndarray]]:
++        """Read one contiguous 56..70 block and decode all STS3215 telemetry."""
++        conn = self._require_connection()
++        for attempt in range(1, self.SYNC_READ_ATTEMPTS + 1):
++            try:
++                comm_result = conn.group_sync_read.txRxPacket()
++                if comm_result != 0:
++                    raise ConnectionError(f"Sync read failed with comm result {comm_result}")
++                positions = np.empty(self.NUM_JOINTS, dtype=np.int32)
++                velocity = np.empty(self.NUM_JOINTS, dtype=np.float32)
++                load = np.empty(self.NUM_JOINTS, dtype=np.float32)
++                voltage = np.empty(self.NUM_JOINTS, dtype=np.float32)
++                temperature = np.empty(self.NUM_JOINTS, dtype=np.float32)
++                current = np.empty(self.NUM_JOINTS, dtype=np.float32)
++                for i, name in enumerate(self.JOINT_ORDER):
++                    servo_id = self.servo_ids[name]
++                    if not conn.group_sync_read.isAvailable(servo_id, STS3215Addr.PRESENT_POSITION, 15):
++                        raise ConnectionError(f"Servo '{name}' (ID {servo_id}) data not available in sync read")
++                    get = conn.group_sync_read.getData
++                    positions[i] = get(servo_id, STS3215Addr.PRESENT_POSITION, 2)
++                    if self.unit == "degrees" and positions[i] & 0x8000:
++                        positions[i] = -(positions[i] & ~0x8000)
++                    velocity[i] = self._decode_velocity(get(servo_id, STS3215Addr.PRESENT_VELOCITY, 2))
++                    load[i] = self._decode_load(get(servo_id, STS3215Addr.PRESENT_LOAD, 2))
++                    voltage[i] = get(servo_id, STS3215Addr.PRESENT_VOLTAGE, 1) * 0.1
++                    temperature[i] = get(servo_id, STS3215Addr.PRESENT_TEMPERATURE, 1)
++                    raw_current = get(servo_id, STS3215Addr.PRESENT_CURRENT, 2)
++                    current[i] = (-1.0 if raw_current & 0x8000 else 1.0) * (raw_current & 0x7FFF) * 0.0065
++                degrees = ticks_to_degrees(positions, self._require_calibration()) if self._calibration is not None else positions.astype(np.float32) * (360.0 / 4095.0)
++                telemetry = {
++                    "motor.velocity": velocity, "motor.load": load, "motor.voltage": voltage,
++                    "motor.temperature": temperature, "motor.current": current,
++                    "ee.pose": self._forward_kinematics(degrees),
++                }
++                return positions, telemetry
++            except ConnectionError:
++                if attempt == self.SYNC_READ_ATTEMPTS:
++                    raise
++                logger.warning(f"SO-101 telemetry sync read attempt {attempt}/{self.SYNC_READ_ATTEMPTS} failed")
++        raise ConnectionError("Telemetry sync read failed")
+ 
+     def _write_joint_positions(self, ticks: np.ndarray) -> None:
+         """Bulk-write goal positions to all servos via sync write.
+--- a/physicalai_so101_plugin/constants.py
++++ b/physicalai_so101_plugin/constants.py
+@@ -76,6 +76,11 @@
+     ACCELERATION = 41
+     GOAL_POSITION = 42
+     PRESENT_POSITION = 56
++    PRESENT_VELOCITY = 58
++    PRESENT_LOAD = 60
++    PRESENT_VOLTAGE = 62
++    PRESENT_TEMPERATURE = 63
++    PRESENT_CURRENT = 69
+ 
+     # Factory registers
+     MAXIMUM_ACCELERATION = 85
+@@ -96,4 +101,9 @@
+     ACCELERATION = 1
+     GOAL_POSITION = 2
+     PRESENT_POSITION = 2
++    PRESENT_VELOCITY = 2
++    PRESENT_LOAD = 2
++    PRESENT_VOLTAGE = 1
++    PRESENT_TEMPERATURE = 1
++    PRESENT_CURRENT = 2
+     MAXIMUM_ACCELERATION = 1

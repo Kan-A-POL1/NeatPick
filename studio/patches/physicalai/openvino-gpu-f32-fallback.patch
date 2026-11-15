@@ -1,0 +1,28 @@
+--- a/physicalai/inference/adapters/openvino.py
++++ b/physicalai/inference/adapters/openvino.py
+@@ -103,11 +103,20 @@
+         core = ov.Core()
+         model = core.read_model(model=str(model_path))
+         try:
+-            self.compiled_model = core.compile_model(
+-                model=model,
+-                device_name=self.device,
+-                config=_compile_config(self.device, self.config),
+-            )
++            try:
++                self.compiled_model = core.compile_model(
++                    model=model,
++                    device_name=self.device,
++                    config=_compile_config(self.device, self.config),
++                )
++            except RuntimeError as e0:
++                # Junction patch: GPU oneDNN fp16 kernels fail on some ACT graphs
++                # ("ProgramBuilder build failed ... could not execute a primitive"); retry in f32.
++                if "GPU" not in self.device.upper() or "ProgramBuilder build failed" not in str(e0):
++                    raise
++                cfg = dict(_compile_config(self.device, self.config) or {})
++                cfg["INFERENCE_PRECISION_HINT"] = "f32"
++                self.compiled_model = core.compile_model(model=model, device_name=self.device, config=cfg)
+         except RuntimeError as e:
+             err = str(e)
+             is_gpu = "GPU" in self.device.upper()

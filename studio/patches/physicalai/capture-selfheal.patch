@@ -1,0 +1,274 @@
+--- a/physicalai/capture/transport/_publisher_worker.py
++++ b/physicalai/capture/transport/_publisher_worker.py
+@@ -27,6 +27,14 @@
+     from physicalai.capture.frame import Frame
+ 
+ _MAX_CONSECUTIVE_FAILURES = 5
++# junction-2026 self-heal. After _MAX_CONSECUTIVE_FAILURES failed reads the worker reopens the device
++# for up to _RECOVER_FOR_S (USB re-enumeration, RealSense firmware reset) before giving up.
++_RECOVER_FOR_S = 45.0
++_RECOVER_BACKOFF_S = 1.0
++# A capture call that never returns (driver stuck after a USB error) would keep the device and the
++# service busy forever: the watchdog kills the process when the loop makes no progress for this long.
++_STALL_EXIT_S = 20.0
++_STALL_EXIT_CODE = 3
+ _CONTROL_MAX_SLICE_LEN = 4096
+ 
+ # Substrings that reliably indicate the device is held by another opener.
+@@ -196,6 +204,77 @@
+     return camera.read_latest()
+ 
+ 
++def _hardware_reset_realsense(config: dict) -> None:
++    """Power-cycle a RealSense from firmware (best-effort): clears the -71 / stuck-stream USB states."""
++    camera = config.get("camera") or {}
++    if not str(camera.get("class_path", "")).endswith("RealSenseCamera"):
++        return
++    serial = str((camera.get("init_args") or {}).get("serial_number", ""))
++    try:
++        import pyrealsense2 as rs  # noqa: PLC0415
++
++        for device in rs.context().query_devices():
++            if device.get_info(rs.camera_info.serial_number) == serial:
++                logger.warning(f"Hardware-resetting RealSense {serial}")
++                device.hardware_reset()
++                return
++        logger.warning(f"RealSense {serial} not enumerated; cannot reset it")
++    except Exception as exc:  # noqa: BLE001
++        logger.warning(f"RealSense {serial} hardware reset failed: {exc!r}")
++
++
++def _recover_camera(state: _PublisherState, service_name: str, progress: list[float]) -> bool:
++    """Reopen the device after repeated read failures, resetting a RealSense once on the way.
++
++    Returns:
++        ``True`` once a reopened camera delivers frames, ``False`` after ``_RECOVER_FOR_S``.
++    """
++    deadline = time.monotonic() + _RECOVER_FOR_S
++    attempt = 0
++    with state.lock:
++        old_camera = state.camera
++    with contextlib.suppress(Exception):
++        old_camera.disconnect()
++    while not shutdown.is_set() and time.monotonic() < deadline:
++        attempt += 1
++        progress[0] = time.monotonic()
++        if attempt == 3:
++            _hardware_reset_realsense(state.config)
++            shutdown.wait(5.0)
++        try:
++            camera = build_camera(state.config)
++            camera.connect()
++            camera.read(timeout=2.0)
++        except Exception as exc:  # noqa: BLE001
++            logger.warning(f"Reopening camera for {service_name} failed (attempt {attempt}): {exc!r}")
++            with contextlib.suppress(Exception):
++                camera.disconnect()  # type: ignore[possibly-undefined]
++            shutdown.wait(_RECOVER_BACKOFF_S)
++            continue
++        with state.lock:
++            state.camera = camera
++        logger.info(f"Camera for {service_name} recovered after {attempt} attempt(s)")
++        return True
++    return False
++
++
++def _start_stall_watchdog(progress: list[float], service_name: str) -> None:
++    """Exit the process when the capture loop stops making progress (driver call stuck)."""
++
++    def watch() -> None:
++        while not shutdown.wait(1.0):
++            stalled = time.monotonic() - progress[0]
++            if stalled > _STALL_EXIT_S:
++                logger.error(
++                    f"Capture loop for {service_name} stuck for {stalled:.0f}s -- exiting so the device is released",
++                )
++                with contextlib.suppress(Exception):
++                    sys.stderr.flush()
++                os._exit(_STALL_EXIT_CODE)
++
++    threading.Thread(target=watch, daemon=True, name="stall-watchdog").start()
++
++
+ class _PublisherState:
+     """Mutable holder for camera/publisher resources shared between threads.
+ 
+@@ -459,6 +538,8 @@
+     from physicalai.capture.errors import CaptureError  # noqa: PLC0415
+ 
+     node_check_interval = max(0.1, idle_timeout / 5)
++    progress = [time.monotonic()]
++    _start_stall_watchdog(progress, service_name)
+ 
+     try:
+         idle_since: float | None = None
+@@ -466,6 +547,7 @@
+         consecutive_failures = 0
+         while not shutdown.is_set():
+             iteration_start = time.monotonic()
++            progress[0] = iteration_start
+             with state.lock:
+                 current_camera = state.camera
+                 current_fps = state.camera_fps
+@@ -479,10 +561,11 @@
+                         continue
+                 consecutive_failures += 1
+                 if consecutive_failures >= _MAX_CONSECUTIVE_FAILURES:
+-                    logger.error(
+-                        f"{consecutive_failures} consecutive read failures -- "
+-                        f"shutting down publisher for {service_name}",
+-                    )
++                    logger.warning(f"{consecutive_failures} consecutive read failures on {service_name}; reopening")
++                    if _recover_camera(state, service_name, progress):
++                        consecutive_failures = 0
++                        continue
++                    logger.error(f"Camera for {service_name} did not recover -- shutting down publisher")
+                     break
+                 continue
+             consecutive_failures = 0
+--- a/physicalai/capture/transport/_shared_camera.py
++++ b/physicalai/capture/transport/_shared_camera.py
+@@ -59,10 +59,18 @@
+                 .publish_subscribe(iox2.Slice[ctypes.c_uint8])
+                 .open()
+             )
++            # The frame service outlives its publisher while any subscriber stays attached (a camera
++            # unplugged under a preview); only the publisher serves /control, so that tells it is alive.
++            control = (
++                node
++                .service_builder(iox2.ServiceName.new(f"{service_name}/control"))
++                .request_response(iox2.Slice[ctypes.c_uint8], iox2.Slice[ctypes.c_uint8])
++                .open()
++            )
+         except Exception:  # noqa: BLE001
+             return False
+         else:
+-            del svc
++            del svc, control
+             return True
+         finally:
+             del node
+@@ -255,30 +263,67 @@
+             idle_timeout=idle_timeout,
+         )
+ 
++    def _spawn_publisher(self, *, force: bool = False) -> bool:
++        """Start a publisher subprocess for this camera.
++
++        Args:
++            force: Spawn even though the service exists. Used when the service
++                is only kept alive by subscribers whose publisher died
++                (junction-2026 self-heal): the new publisher takes the free
++                publisher slot of the existing service.
++
++        Returns:
++            ``True`` if this call started a publisher.
++
++        Raises:
++            CaptureError: If the publisher could not start and none is reachable.
++        """
++        from ._publisher import CameraPublisher  # noqa: PLC0415
++        from ._spec import CameraPublisherConfig  # noqa: PLC0415
++
++        spec = CameraPublisherConfig(camera=self._camera)
++        publisher = CameraPublisher(spec, self._service_name, idle_timeout=self._idle_timeout)
++        try:
++            publisher.start()
++        except Exception as exc:
++            if not force and _probe_with_retry(self._service_name, timeout=3.0):
++                logger.debug(f"Lost publisher race for {self._service_name} — using existing")
++                return False
++            msg = (
++                f"failed to start camera publisher for {self._service_name}: {exc}. "
++                "The publisher opens the device exclusively; another connected "
++                "holder of the same hardware will cause open to fail."
++            )
++            raise CaptureError(msg) from exc
++        self._publisher = publisher
++        return True
++
++    def _wait_first_sample(self, deadline: float) -> bool:
++        iox2 = cast("Any", import_module("iceoryx2"))
++        while time.monotonic() < deadline:
++            sample = self._subscriber.receive()
++            if sample is not None:
++                header, frame = self._decode_sample(sample)
++                self._last_header = header
++                self._latest = frame
++                self._negotiate_config(header, timeout=deadline - time.monotonic())
++                self._connected = True
++                return True
++
++            remaining = deadline - time.monotonic()
++            if remaining > 0:
++                self._listener.timed_wait_one(
++                    iox2.Duration.from_secs_f64(min(remaining, 0.5)),
++                )
++        return False
++
+     def connect(self, timeout: float = 5.0) -> None:
+         if self._connected:
+             return
+ 
++        spawned = False
+         if self._camera is not None and not _probe_service(self._service_name):
+-            from ._publisher import CameraPublisher  # noqa: PLC0415
+-            from ._spec import CameraPublisherConfig  # noqa: PLC0415
+-
+-            spec = CameraPublisherConfig(camera=self._camera)
+-            publisher = CameraPublisher(spec, self._service_name, idle_timeout=self._idle_timeout)
+-            try:
+-                publisher.start()
+-            except Exception as exc:
+-                if _probe_with_retry(self._service_name, timeout=3.0):
+-                    logger.debug(f"Lost publisher race for {self._service_name} — using existing")
+-                else:
+-                    msg = (
+-                        f"failed to start camera publisher for {self._service_name}: {exc}. "
+-                        "The publisher opens the device exclusively; another connected "
+-                        "holder of the same hardware will cause open to fail."
+-                    )
+-                    raise CaptureError(msg) from exc
+-            else:
+-                self._publisher = publisher
++            spawned = self._spawn_publisher()
+ 
+         iox2 = cast("Any", import_module("iceoryx2"))
+ 
+@@ -304,22 +349,21 @@
+         self._listener = event_svc.listener_builder().create()
+ 
+         logger.debug(f"Connecting SharedCamera subscriber to {self._service_name}")
+-        deadline = time.monotonic() + timeout
+-        while time.monotonic() < deadline:
+-            sample = self._subscriber.receive()
+-            if sample is not None:
+-                header, frame = self._decode_sample(sample)
+-                self._last_header = header
+-                self._latest = frame
+-                self._negotiate_config(header, timeout=deadline - time.monotonic())
+-                self._connected = True
+-                return
++        if self._wait_first_sample(time.monotonic() + timeout):
++            return
+ 
+-            remaining = deadline - time.monotonic()
+-            if remaining > 0:
+-                self._listener.timed_wait_one(
+-                    iox2.Duration.from_secs_f64(min(remaining, 0.5)),
+-                )
++        # junction-2026 self-heal: the service exists but nothing publishes on it. Its publisher died
++        # (USB drop, crash, watchdog exit) while other subscribers kept the service alive, so the probe
++        # above wrongly reported a live publisher. Start a new one on the same service and wait again.
++        if self._camera is not None and not spawned:
++            logger.warning(f"No frames on {self._service_name} although the service exists; respawning its publisher")
++            try:
++                spawned = self._spawn_publisher(force=True)
++            except CaptureError as exc:
++                logger.warning(f"Respawning the publisher for {self._service_name} failed: {exc}")
++            if spawned and self._wait_first_sample(time.monotonic() + timeout):
++                logger.info(f"Publisher for {self._service_name} respawned")
++                return
+ 
+         logger.debug(f"SharedCamera connect timeout for {self._service_name}")
+         self._do_disconnect()

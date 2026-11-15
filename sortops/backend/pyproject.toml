@@ -1,0 +1,18 @@
+[project]
+name = "sortops"
+version = "0.1.0"
+description = "SO-101 sorting cell orchestrator: ACT policies + Anomalib on OpenVINO, with a web cockpit"
+requires-python = ">=3.12"
+# On the robot PC it runs in Physical AI Studio's backend venv, which already provides physicalai,
+# the SO-101 plugin, OpenVINO, FastAPI, uvicorn, websockets, OpenCV, numpy, psutil and loguru.
+dependencies = ["fastapi", "uvicorn[standard]", "numpy", "opencv-python-headless", "psutil", "loguru"]
+
+[project.optional-dependencies]
+dev = ["pytest", "httpx"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.ruff]
+line-length = 120
